@@ -378,7 +378,7 @@ fn change_version_string(arg: u64, string: *const c_char) {
 
     if original_str.starts_with("Ver.") {
         let new_str = format!(
-            "Smash {}\nARCropolis Ver. {}\0",
+            "Smash {}\nARCropolis Ver. {}-patched\0",
             original_str,
             crate::utils::env::get_arcropolis_version()
         );
@@ -506,6 +506,7 @@ pub fn main() {
         };
 
         let err_msg = format!("ARCropolis has panicked at '{}', {}", msg, location);
+        crate::modfs::patched::note_panic(msg, location.file(), location.line(), location.column());
         skyline::error::show_error(
             69,
             "ARCropolis has panicked! Please open the details and send a screenshot to the developer, then close the game.\n\0",

@@ -4,7 +4,10 @@ use std::{
     hash::{Hash, Hasher},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        LazyLock,
+    },
 };
 
 use smash_arc::{Hash40, Region};
@@ -185,25 +188,124 @@ pub fn decode_header(bytes: &[u8]) -> Option<(u64, u64, u64)> {
     Some((u64::from_le_bytes(key), u64::from_le_bytes(len), u64::from_le_bytes(sum)))
 }
 
+fn append_note(line: &str) {
+    let _ = std::fs::create_dir_all(dir());
+    let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir().join("reject.log"))
+    else {
+        return;
+    };
+    let _ = log.write_all(line.as_bytes());
+    let _ = log.sync_all();
+}
+
+static SERVING: AtomicU64 = AtomicU64::new(0);
+static SERVING_ON: AtomicBool = AtomicBool::new(false);
+
+struct Serving;
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        SERVING_ON.store(false, Ordering::Relaxed);
+    }
+}
+
+fn enter_serving(entry: &PatchedEntry) -> Serving {
+    if let Some(name) = entry.path.file_name().and_then(|name| name.to_str()) {
+        if let Some(hash) = parse_blob_name(name) {
+            SERVING.store(hash.0, Ordering::Relaxed);
+            SERVING_ON.store(true, Ordering::Relaxed);
+        }
+    }
+    Serving
+}
+
+pub fn note_panic(message: &str, file: &str, line: u32, column: u32) {
+    let message = message.replace(['\n', '\r'], " ");
+    let hash = if SERVING_ON.load(Ordering::Relaxed) {
+        format!(" hash {:010x}", SERVING.load(Ordering::Relaxed))
+    } else {
+        String::new()
+    };
+    append_note(&format!("panic {file}:{line}:{column}{hash} {message}\n"));
+}
+
+pub fn note_recipe(
+    hash: Hash40,
+    key: u64,
+    bytes: &[u8],
+    region: Region,
+    base_size: usize,
+    chain: &[&str],
+    sources: &[SourceStamp],
+) {
+    let sum = payload_sum(bytes);
+    let mut sources_text = String::new();
+    for source in sources {
+        if !sources_text.is_empty() {
+            sources_text.push('|');
+        }
+        sources_text.push_str(&format!("{} {:#x} {}", source.path.display(), source.size, source.mtime));
+    }
+    append_note(&format!(
+        "{:010x} wrote key {:016x} sum {:016x} len {:#x} region {region:?} base {base_size:#x} chain {} sources {sources_text}\n",
+        hash.0,
+        key,
+        sum,
+        bytes.len(),
+        chain.join(",")
+    ));
+}
+
+fn alert(reason: &str) {
+    skyline::error::show_error(
+        69,
+        "ARCropolis kept a bad cache file.\nClose the game to copy it, or continue.\0",
+        &format!("{reason}\nSee reject.log in the patched cache folder.\0"),
+    );
+}
+
+fn park(path: &Path, reason: &str) {
+    let bad = path.with_extension("bad");
+    let _ = std::fs::remove_file(&bad);
+    let parked = std::fs::rename(path, &bad).is_ok();
+    let line = format!("{reason} parked={parked}");
+    append_note(&format!("{line}\n"));
+    alert(&line);
+}
+
+pub fn note_index(hash: Hash40, index: usize) {
+    let line = format!("{:010x} path-index {index}", hash.0);
+    append_note(&format!("{line}\n"));
+    alert(&line);
+}
+
 pub fn probe(hash: Hash40, key: u64) -> Option<PatchedEntry> {
     let path = blob_path(hash);
     let mut file = File::open(&path).ok()?;
     let mut header = [0u8; HEADER_LEN];
-    file.read_exact(&mut header).ok()?;
+    if file.read_exact(&mut header).is_err() {
+        drop(file);
+        park(&path, &format!("{:010x} short-header", hash.0));
+        return None;
+    }
     let (stored_key, len, _) = decode_header(&header)?;
     if stored_key != key {
         return None;
     }
-    if file.metadata().ok()?.len() != HEADER_LEN as u64 + len {
+    let size = file.metadata().ok()?.len();
+    if size != HEADER_LEN as u64 + len {
+        drop(file);
+        park(&path, &format!("{:010x} size file {size:#x} header {len:#x}", hash.0));
         return None;
     }
-    let entry = PatchedEntry {
+    Some(PatchedEntry {
         path,
         len: len as usize,
         key,
-    };
-    read(&entry).ok()?;
-    Some(entry)
+    })
 }
 
 pub fn write(hash: Hash40, key: u64, bytes: &[u8]) -> std::io::Result<PatchedEntry> {
@@ -256,14 +358,26 @@ pub fn prune(keep: &HashSet<Hash40>) -> usize {
     removed
 }
 
-pub fn read(entry: &PatchedEntry) -> Result<Vec<u8>, ModFsError> {
+fn open_checked(entry: &PatchedEntry) -> Result<(File, u64), ModFsError> {
     let mut file = File::open(&entry.path)?;
     let mut header = [0u8; HEADER_LEN];
-    file.read_exact(&mut header)?;
+    if file.read_exact(&mut header).is_err() {
+        drop(file);
+        park(&entry.path, &format!("{} short-header", entry.path.display()));
+        return Err(ModFsError::Handler(format!(
+            "patched blob {} has a short header",
+            entry.path.display()
+        )));
+    }
     let (_, len, sum) = decode_header(&header).ok_or_else(|| {
         ModFsError::Handler(format!("patched blob {} has a short header", entry.path.display()))
     })?;
     if len as usize != entry.len {
+        drop(file);
+        park(
+            &entry.path,
+            &format!("{} length entry {:#x} header {:#x}", entry.path.display(), entry.len, len),
+        );
         return Err(ModFsError::Handler(format!(
             "patched blob {} holds {:#x} bytes but its header says {:#x}",
             entry.path.display(),
@@ -271,19 +385,50 @@ pub fn read(entry: &PatchedEntry) -> Result<Vec<u8>, ModFsError> {
             len
         )));
     }
+    Ok((file, sum))
+}
+
+fn confirm_sum(entry: &PatchedEntry, bytes: &[u8], sum: u64) -> Result<(), ModFsError> {
+    let actual = payload_sum(bytes);
+    if actual == sum {
+        return Ok(());
+    }
+    let name = entry.path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("?");
+    park(
+        &entry.path,
+        &format!(
+            "{name} checksum key {:016x} len {:#x} stored {:016x} actual {:016x}",
+            entry.key, entry.len, sum, actual
+        ),
+    );
+    Err(ModFsError::Handler(format!(
+        "patched blob {} checksum does not match its header",
+        entry.path.display()
+    )))
+}
+
+pub fn read(entry: &PatchedEntry) -> Result<Vec<u8>, ModFsError> {
+    let _serving = enter_serving(entry);
+    let (mut file, sum) = open_checked(entry)?;
     let mut bytes = vec![0u8; entry.len];
     file.read_exact(&mut bytes)?;
-    if payload_sum(&bytes) != sum {
-        return Err(ModFsError::Handler(format!(
-            "patched blob {} checksum does not match its header",
-            entry.path.display()
-        )));
-    }
+    confirm_sum(entry, &bytes, sum)?;
     Ok(bytes)
 }
 
 pub fn read_into(entry: &PatchedEntry, buffer: &mut [u8]) -> Result<usize, ModFsError> {
-    super::copy_into(&read(entry)?, buffer)
+    let _serving = enter_serving(entry);
+    if entry.len > buffer.len() {
+        return Err(ModFsError::BufferTooSmall {
+            needed: entry.len,
+            available: buffer.len(),
+        });
+    }
+    let (mut file, sum) = open_checked(entry)?;
+    let bytes = &mut buffer[..entry.len];
+    file.read_exact(bytes)?;
+    confirm_sum(entry, bytes, sum)?;
+    Ok(entry.len)
 }
 
 #[cfg(test)]

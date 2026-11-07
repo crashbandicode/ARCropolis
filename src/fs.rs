@@ -332,7 +332,12 @@ impl CachedFilesystem {
             .keys()
             .filter_map(|&hash| {
                 arc.get_file_info_from_hash(hash).ok().and_then(|info| {
-                    let canonical = file_paths.get(usize::from(info.file_path_index))?.path.hash40();
+                    let index = usize::from(info.file_path_index);
+                    let Some(file_path) = file_paths.get(index) else {
+                        crate::modfs::patched::note_index(hash, index);
+                        return None;
+                    };
+                    let canonical = file_path.path.hash40();
                     if canonical != hash { Some((hash, canonical)) } else { None }
                 })
             })
@@ -352,7 +357,12 @@ impl CachedFilesystem {
                     return None;
                 }
                 let info = arc.get_file_info_from_hash(hash).ok()?;
-                let canonical = file_paths.get(usize::from(info.file_path_index))?.path.hash40();
+                let index = usize::from(info.file_path_index);
+                let Some(file_path) = file_paths.get(index) else {
+                    crate::modfs::patched::note_index(hash, index);
+                    return None;
+                };
+                let canonical = file_path.path.hash40();
                 (canonical != hash).then_some((canonical, hash))
             })
             .collect();
