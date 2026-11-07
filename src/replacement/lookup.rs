@@ -34,103 +34,116 @@ impl DerefMut for UnshareLookup {
 }
 
 enum UnshareLookupState {
-    Missing,
+    Unloaded,
     Generated(UnshareLookup),
 }
 
 enum ShareLookupState {
-    Missing,
+    Unloaded,
     Generated(ShareLookup),
 }
 
-const LUT_VERSION: u32 = 1;
+static UNSHARE_LOOKUP: LazyLock<RwLock<UnshareLookupState>> = LazyLock::new(|| RwLock::new(UnshareLookupState::Unloaded));
 
-static UNSHARE_LOOKUP: LazyLock<RwLock<UnshareLookupState>> = LazyLock::new(|| {
-    let path = crate::utils::paths::cache().join("unshare.lut");
-    let lut = match std::fs::read(&path) {
-        Ok(data) => match bincode::deserialize::<(u32, UnshareLookup)>(&data) {
-            Ok((LUT_VERSION, lut)) => UnshareLookupState::Generated(lut),
-            _ => {
-                error!("Unable to parse '{}' for unsharing. Boot time might be a bit slow.", path);
-                UnshareLookupState::Missing
-            },
-        },
+static SHARE_LOOKUP: LazyLock<RwLock<ShareLookupState>> = LazyLock::new(|| RwLock::new(ShareLookupState::Unloaded));
+
+/// Discovery publishes the key on another thread, after a short delay. Wait for it
+/// before trusting or replacing a LUT, then give up so boot can still build one in memory.
+fn published_lut_key() -> Option<u64> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(key) = crate::fs::published_lut_key() {
+            return Some(key);
+        }
+        if start.elapsed() >= std::time::Duration::from_secs(20) {
+            error!("Mod discovery did not publish a LUT key. The share tables will be rebuilt in memory.");
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn read_cached_lut<T: serde::de::DeserializeOwned>(file_name: &str, key: u64) -> Option<T> {
+    let path = crate::utils::paths::cache().join(file_name);
+    let data = match std::fs::read(&path) {
+        Ok(data) => data,
         Err(err) => {
             error!("Unable to read '{}'. Reason: {:?}", path, err);
-            UnshareLookupState::Missing
+            return None;
         },
     };
-
-    RwLock::new(lut)
-});
-
-static SHARE_LOOKUP: LazyLock<RwLock<ShareLookupState>> = LazyLock::new(|| {
-    let path = crate::utils::paths::cache().join("share.lut");
-    let lut = match std::fs::read(&path) {
-        Ok(data) => match bincode::deserialize::<(u32, ShareLookup)>(&data) {
-            Ok((LUT_VERSION, lut)) => ShareLookupState::Generated(lut),
-            _ => {
-                error!("Unable to parse '{}' for share lookup. Boot time might be a bit slow.", path);
-                ShareLookupState::Missing
-            },
-        },
+    let Some(payload) = crate::fs::read_keyed_payload(&data, key) else {
+        error!("'{}' does not match this mod set. It will be rebuilt.", path);
+        return None;
+    };
+    match bincode::deserialize(payload) {
+        Ok(lut) => Some(lut),
         Err(err) => {
-            error!("Unable to read '{}'. Reason: {:?}", path, err);
-            ShareLookupState::Missing
+            error!("Unable to parse '{}'. Reason: {:?}. Boot time might be a bit slow.", path, err);
+            None
         },
-    };
+    }
+}
 
-    RwLock::new(lut)
-});
+fn write_cached_lut<T: serde::Serialize>(file_name: &str, key: u64, value: &T) {
+    let path = crate::utils::paths::cache().join(file_name);
+    match bincode::serialize(value) {
+        Ok(payload) => {
+            let bytes = crate::fs::prefix_key(key, &payload);
+            if let Err(err) = std::fs::write(&path, bytes) {
+                error!("Failed to write LUT to cache file at '{}'. Reason: {:?}", path, err);
+            }
+        },
+        Err(err) => error!("Failed to serialize LUT into bytes. Reason: {:?}", err),
+    }
+}
 
 pub fn initialize_unshare(arc: Option<&LoadedArc>) {
-    if arc.is_none() {
-        LazyLock::force(&UNSHARE_LOOKUP);
+    let key = published_lut_key();
+    let mut lookup_state = UNSHARE_LOOKUP.write().unwrap();
+    if matches!(*lookup_state, UnshareLookupState::Generated(_)) {
         return;
     }
-    let arc = arc.unwrap();
-    let mut lookup_state = UNSHARE_LOOKUP.write().unwrap();
-    let lookup = match *lookup_state {
-        UnshareLookupState::Missing => {
-            let mut lookup = UnshareLookup(HashMap::new());
-
-            let file_paths = arc.get_file_paths();
-
-            for dir_info in arc.get_dir_infos() {
-                for (child_index, file_info) in arc.get_file_infos()[dir_info.file_info_range()].iter().enumerate() {
-                    lookup.insert(file_paths[file_info.file_path_index].path.hash40(), (dir_info.path.hash40(), child_index));
-                }
-            }
-
-            match bincode::serialize(&(LUT_VERSION, &lookup)) {
-                Ok(data) => {
-                    let path = crate::utils::paths::cache().join("unshare.lut");
-                    if let Err(e) = std::fs::write(&path, data) {
-                        error!("Failed to write unshare LUT to cache file at '{}'. Reason: {:?}", path, e);
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to serialize unshare LUT into bytes. Reason: {:?}", *e);
-                },
-            }
-
-            UnshareLookupState::Generated(lookup)
-        },
-        UnshareLookupState::Generated(_) => return,
+    if let Some(key) = key {
+        if let Some(lut) = read_cached_lut("unshare.lut", key) {
+            *lookup_state = UnshareLookupState::Generated(lut);
+            return;
+        }
+    }
+    let Some(arc) = arc else {
+        return;
     };
-    *lookup_state = lookup;
+
+    let mut lookup = UnshareLookup(HashMap::new());
+    let file_paths = arc.get_file_paths();
+    for dir_info in arc.get_dir_infos() {
+        for (child_index, file_info) in arc.get_file_infos()[dir_info.file_info_range()].iter().enumerate() {
+            lookup.insert(file_paths[file_info.file_path_index].path.hash40(), (dir_info.path.hash40(), child_index));
+        }
+    }
+    if let Some(key) = key {
+        write_cached_lut("unshare.lut", key, &lookup);
+    }
+    *lookup_state = UnshareLookupState::Generated(lookup);
 }
 
 pub fn initialize_share(arc: Option<&LoadedArc>) {
-    if arc.is_none() {
-        LazyLock::force(&SHARE_LOOKUP);
+    let key = published_lut_key();
+    let mut lookup_state = SHARE_LOOKUP.write().unwrap();
+    if matches!(*lookup_state, ShareLookupState::Generated(_)) {
         return;
     }
+    if let Some(key) = key {
+        if let Some(lut) = read_cached_lut("share.lut", key) {
+            *lookup_state = ShareLookupState::Generated(lut);
+            return;
+        }
+    }
+    let Some(arc) = arc else {
+        return;
+    };
 
-    let arc = arc.unwrap();
-    let mut lookup_state = SHARE_LOOKUP.write().unwrap();
-    let lookup = match *lookup_state {
-        ShareLookupState::Missing => {
+    let lookup = {
             let mut path_shared: HashMap<Hash40, Vec<Hash40>> = HashMap::new();
 
             let mut shared_files = HashSet::new();
@@ -173,28 +186,15 @@ pub fn initialize_share(arc: Option<&LoadedArc>) {
                 }
             }
 
-            let lookup = ShareLookup {
+            ShareLookup {
                 is_shared_search: shared_files,
                 shared_file_lookup: path_shared,
-            };
-
-            match bincode::serialize(&(LUT_VERSION, &lookup)) {
-                Ok(data) => {
-                    let path = crate::utils::paths::cache().join("share.lut");
-                    if let Err(e) = std::fs::write(&path, data) {
-                        error!("Failed to write share LUT to cache file at '{}'. Reason: {:?}", path, e);
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to serialize share LUT into bytes. Reason: {:?}", *e);
-                },
             }
-
-            ShareLookupState::Generated(lookup)
-        },
-        ShareLookupState::Generated(_) => return,
     };
-    *lookup_state = lookup;
+    if let Some(key) = key {
+        write_cached_lut("share.lut", key, &lookup);
+    }
+    *lookup_state = ShareLookupState::Generated(lookup);
 }
 
 pub fn initialize(arc: Option<&LoadedArc>) {

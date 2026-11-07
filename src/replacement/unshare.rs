@@ -349,14 +349,16 @@ fn unshare_file(
     // to modify its `standalone_file` flag (this is one that ARCropolis adds)
     // This isn't technically necessary but since we are here anyways it does help. This information is also stored in one of the
     // cache files
-    if idx != 0xFF_FFFF {
-        let mut dir_file_info = ctx.file_infos[dir_info.file_info_range()][idx];
+    let range = dir_info.file_info_range();
+    let child_count = range.end.saturating_sub(range.start);
+    if let Some(child) = plain_index(idx as u32, child_count) {
+        let mut dir_file_info = ctx.file_infos[range.clone()][child];
 
         dir_file_info.file_info_indice_index = new_info_indice_idx;
         dir_file_info.flags.set_standalone_file(true);
 
         // Recopy the new formmated FileInfo back into the DirInfo's children
-        ctx.file_infos[dir_info.file_info_range()][idx] = dir_file_info;
+        ctx.file_infos[range][child] = dir_file_info;
     }
 
     // Finally push the new file info, make the new FileInfoIndex and push that as well

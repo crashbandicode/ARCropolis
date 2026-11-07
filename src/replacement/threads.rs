@@ -2,7 +2,7 @@ use owo_colors::OwoColorize;
 use skyline::{hook, hooks::InlineCtx};
 use smash_arc::{ArcLookup, Hash40};
 
-use super::{FileInfoFlagsExt, NO_CHILD};
+use super::{plain_index, FileInfoFlagsExt, NO_CHILD};
 use crate::{
     hashes, offsets, reg_w, reg_x,
     resource::{self, InflateFile, LoadInfo, LoadType},
@@ -165,7 +165,14 @@ fn res_loop_common() {
     for (list_idx, list) in service.res_lists.iter().enumerate() {
         for entry in list.iter() {
             if let LoadType::Directory = entry.ty {
-                for info in file_infos[dir_infos[entry.directory_index as usize].file_info_range()].iter() {
+                let Some(directory_index) = plain_index(entry.directory_index, dir_infos.len()) else {
+                    continue;
+                };
+                let info_range = dir_infos[directory_index].file_info_range();
+                if info_range.start > info_range.end || info_range.end > file_infos.len() {
+                    continue;
+                }
+                for info in file_infos[info_range].iter() {
                     if info.flags.standalone_file() {
                         standalone_files[list_idx].push(info.file_path_index);
                     }

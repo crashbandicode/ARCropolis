@@ -353,8 +353,15 @@ pub fn read(entry: &PatchedEntry) -> Result<Vec<u8>, ModFsError> {
 }
 
 pub fn read_into(entry: &PatchedEntry, buffer: &mut [u8]) -> Result<usize, ModFsError> {
-    let file = open_payload(entry)?;
-    super::stream_into(file, buffer, entry.len)
+    if entry.len > buffer.len() {
+        return Err(ModFsError::BufferTooSmall {
+            needed: entry.len,
+            available: buffer.len(),
+        });
+    }
+    let mut file = open_payload(entry)?;
+    file.read_exact(&mut buffer[..entry.len])?;
+    Ok(entry.len)
 }
 
 #[cfg(test)]
@@ -501,6 +508,14 @@ mod tests {
         let entry = write(hash, key, payload).unwrap();
         let indexed = probe(hash, key).unwrap();
         assert_eq!((indexed.len, read(&indexed).unwrap()), (entry.len, payload.to_vec()));
+        let mut buffer = [0u8; 32];
+        assert_eq!(read_into(&indexed, &mut buffer).unwrap(), payload.len());
+        assert_eq!(&buffer[..payload.len()], payload);
+        assert!(read_into(&indexed, &mut buffer[..payload.len() - 1]).is_err());
+        let mut short = std::fs::read(blob_path(hash)).unwrap();
+        short.truncate(HEADER_LEN + 1);
+        std::fs::write(blob_path(hash), short).unwrap();
+        assert!(read_into(&indexed, &mut buffer).is_err());
         DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(root);
     }

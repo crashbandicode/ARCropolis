@@ -17,6 +17,7 @@ use crate::{
 };
 
 mod cache;
+pub(crate) use cache::{prefix_key, published_lut_key, read_keyed_payload};
 mod discover;
 pub mod inference;
 mod utils;

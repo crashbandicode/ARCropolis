@@ -2,7 +2,35 @@ use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::PathBuf,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
+
+#[path = "lutkey.rs"]
+mod lutkey;
+pub(crate) use lutkey::{lut_key, prefix_key, read_keyed_payload};
+
+static DISCOVERY_KEY: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_KEY_READY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn publish_discovery_key(key: u64) {
+    DISCOVERY_KEY.store(key, Ordering::Release);
+    DISCOVERY_KEY_READY.store(true, Ordering::Release);
+}
+
+pub(crate) fn published_discovery_key() -> Option<u64> {
+    if DISCOVERY_KEY_READY.load(Ordering::Acquire) {
+        Some(DISCOVERY_KEY.load(Ordering::Acquire))
+    } else {
+        None
+    }
+}
+
+/// Discovery's mod-set key mixed with the game version the cache directory names.
+pub(crate) fn published_lut_key() -> Option<u64> {
+    let discovery = published_discovery_key()?;
+    let version = crate::utils::env::get_game_version().to_string();
+    Some(lut_key(discovery, &version))
+}
 
 use smash_arc::Region;
 

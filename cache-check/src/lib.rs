@@ -1,3 +1,11 @@
+#[allow(dead_code)]
+#[path = "../../src/fs/lutkey.rs"]
+mod lutkey;
+
+#[allow(dead_code)]
+#[path = "../../src/replacement/indexmask.rs"]
+mod indexmask;
+
 pub mod utils {
     pub mod paths {
         use std::path::PathBuf;
@@ -20,15 +28,6 @@ pub mod modfs {
         fn from(error: std::io::Error) -> Self {
             ModFsError::Io(error)
         }
-    }
-
-    fn stream_into(mut file: std::fs::File, buffer: &mut [u8], needed: usize) -> Result<usize, ModFsError> {
-        use std::io::Read;
-        let read = file.read(buffer)?;
-        if read < needed && read == buffer.len() {
-            return Err(ModFsError::BufferTooSmall { needed, available: buffer.len() });
-        }
-        Ok(read)
     }
 
     pub mod patched {

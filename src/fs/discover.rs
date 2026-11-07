@@ -208,6 +208,7 @@ pub fn perform_discovery() -> DiscoveryResult {
             .collect(),
         Err(e) => {
             error!("Could not read mods directory {}: {:?}", mods_path, e);
+            super::cache::publish_discovery_key(super::cache::discovery_key(config::region(), &[]));
             return DiscoveryResult { entries, collected };
         },
     };
@@ -226,6 +227,7 @@ pub fn perform_discovery() -> DiscoveryResult {
         .collect();
 
     let cache_key = super::cache::discovery_key(region, &walked);
+    super::cache::publish_discovery_key(cache_key);
     if let Some(cached) = super::cache::load_discovery(cache_key) {
         let DiscoveryResult { entries, collected } = cached;
 

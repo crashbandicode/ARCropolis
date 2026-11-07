@@ -18,14 +18,7 @@ use crate::{
     PathExtension,
 };
 
-pub const NO_CHILD: u32 = 0xFF_FFFF;
-
-/// The no-child marker is 24 bits. `0x40FFFFFF` is that marker with bit 30 set, and a raw compare lets it through.
-pub fn child_index(index: u32) -> Option<usize> {
-    let index = (index & NO_CHILD) as usize;
-    if index == NO_CHILD as usize { None } else { Some(index) }
-}
-pub const INVALID_INDEX: u32 = 0xFFFF_FFFF;
+include!("indexmask.rs");
 
 /// Used to keep track of added DirInfo children.
 #[derive(Debug)]
@@ -582,8 +575,8 @@ fn rebuild_all_paths(search: &LoadedSearchSection) -> Vec<HashToIndex> {
     let paths = search.get_path_list();
     let mut index_link = HashMap::new();
     for (idx, index) in search.get_path_list_indices().iter().enumerate() {
-        if *index != INVALID_INDEX && *index != NO_CHILD {
-            index_link.insert(paths[*index as usize].path.hash40(), idx);
+        if let Some(path_index) = plain_index(*index, paths.len()) {
+            index_link.insert(paths[path_index].path.hash40(), idx);
         }
     }
     let mut indices = Vec::with_capacity(paths.len());
@@ -604,8 +597,8 @@ fn merge_new_paths(search: &LoadedSearchSection, old_indices_count: usize, old_p
 
     let mut index_link = HashMap::new();
     for (pos, index) in indices.iter().enumerate().skip(old_indices_count) {
-        if *index != INVALID_INDEX && *index != NO_CHILD {
-            index_link.insert(paths[*index as usize].path.hash40(), pos);
+        if let Some(path_index) = plain_index(*index, paths.len()) {
+            index_link.insert(paths[path_index].path.hash40(), pos);
         }
     }
     let mut adds: Vec<HashToIndex> = paths[old_path_count..]
@@ -988,18 +981,5 @@ impl FromPathExt for PathListEntry {
         result.parent.set_length(parent_hash.len());
 
         Some(result)
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::{child_index, NO_CHILD};
-
-    #[test]
-    fn flagged_no_child_is_empty() {
-        assert_eq!(child_index(0x40FF_FFFF), None);
-        assert_eq!(child_index(NO_CHILD), None);
-        assert_eq!(child_index(0x4000_002A), Some(0x2A));
     }
 }
