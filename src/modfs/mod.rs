@@ -438,7 +438,6 @@ impl ModFs {
 
             match patched::write(hash, key, &bytes) {
                 Ok(entry) => {
-                    patched::note_recipe(hash, key, &bytes, region, base_size, &chain, &sources);
                     debug!(
                         "patched cache: wrote '{}' ({:#x}) {:#x} bytes (vanilla {:#x}, estimate was {:#x}) key {:#x} from {} sources",
                         crate::hashes::find(hash),

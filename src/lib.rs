@@ -492,6 +492,7 @@ unsafe fn title_scene_show_how_to_play_fake_state_index(ctx: &mut InlineCtx) {
     ctx.registers[8].set_x(5);
 }
 
+#[cfg(not(test))]
 #[skyline::main(name = "arcropolis")]
 pub fn main() {
     std::panic::set_hook(Box::new(|info| {
@@ -506,7 +507,6 @@ pub fn main() {
         };
 
         let err_msg = format!("ARCropolis has panicked at '{}', {}", msg, location);
-        crate::modfs::patched::note_panic(msg, location.file(), location.line(), location.column());
         skyline::error::show_error(
             69,
             "ARCropolis has panicked! Please open the details and send a screenshot to the developer, then close the game.\n\0",

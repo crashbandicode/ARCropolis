@@ -1,13 +1,11 @@
 use std::{
+    cell::RefCell,
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs::File,
     hash::{Hash, Hasher},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        LazyLock,
-    },
+    sync::LazyLock,
 };
 
 use smash_arc::{Hash40, Region};
@@ -86,7 +84,14 @@ impl PatchedIndex {
     }
 }
 
+thread_local! {
+    static DIR_OVERRIDE: RefCell<Option<PathBuf>> = RefCell::new(None);
+}
+
 pub fn dir() -> PathBuf {
+    if let Some(path) = DIR_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
     crate::utils::paths::cache().join("patched").into()
 }
 
@@ -158,13 +163,35 @@ pub fn key(region: Region, base_size: usize, chain: &[&str], sources: &[SourceSt
     hasher.finish()
 }
 
-fn payload_sum(bytes: &[u8]) -> u64 {
-    let mut sum = 0xcbf29ce484222325u64;
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+fn mix(mut sum: u64, bytes: &[u8]) -> u64 {
     for &byte in bytes {
         sum ^= byte as u64;
-        sum = sum.wrapping_mul(0x100000001b3);
+        sum = sum.wrapping_mul(FNV_PRIME);
     }
     sum
+}
+
+fn payload_sum(bytes: &[u8]) -> u64 {
+    mix(FNV_OFFSET, bytes)
+}
+
+fn stream_sum(file: &mut File, len: u64) -> std::io::Result<u64> {
+    let mut sum = FNV_OFFSET;
+    let mut left = len;
+    let mut buf = [0u8; 8192];
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short payload"));
+        }
+        sum = mix(sum, &buf[..n]);
+        left -= n as u64;
+    }
+    Ok(sum)
 }
 
 pub fn encode_header(key: u64, len: u64, sum: u64) -> [u8; HEADER_LEN] {
@@ -188,7 +215,12 @@ pub fn decode_header(bytes: &[u8]) -> Option<(u64, u64, u64)> {
     Some((u64::from_le_bytes(key), u64::from_le_bytes(len), u64::from_le_bytes(sum)))
 }
 
-fn append_note(line: &str) {
+fn park(path: &Path, reason: &str) {
+    let bad = path.with_extension("bad");
+    let _ = std::fs::remove_file(&bad);
+    if std::fs::rename(path, &bad).is_err() {
+        return;
+    }
     let _ = std::fs::create_dir_all(dir());
     let Ok(mut log) = std::fs::OpenOptions::new()
         .create(true)
@@ -197,89 +229,7 @@ fn append_note(line: &str) {
     else {
         return;
     };
-    let _ = log.write_all(line.as_bytes());
-    let _ = log.sync_all();
-}
-
-static SERVING: AtomicU64 = AtomicU64::new(0);
-static SERVING_ON: AtomicBool = AtomicBool::new(false);
-
-struct Serving;
-
-impl Drop for Serving {
-    fn drop(&mut self) {
-        SERVING_ON.store(false, Ordering::Relaxed);
-    }
-}
-
-fn enter_serving(entry: &PatchedEntry) -> Serving {
-    if let Some(name) = entry.path.file_name().and_then(|name| name.to_str()) {
-        if let Some(hash) = parse_blob_name(name) {
-            SERVING.store(hash.0, Ordering::Relaxed);
-            SERVING_ON.store(true, Ordering::Relaxed);
-        }
-    }
-    Serving
-}
-
-pub fn note_panic(message: &str, file: &str, line: u32, column: u32) {
-    let message = message.replace(['\n', '\r'], " ");
-    let hash = if SERVING_ON.load(Ordering::Relaxed) {
-        format!(" hash {:010x}", SERVING.load(Ordering::Relaxed))
-    } else {
-        String::new()
-    };
-    append_note(&format!("panic {file}:{line}:{column}{hash} {message}\n"));
-}
-
-pub fn note_recipe(
-    hash: Hash40,
-    key: u64,
-    bytes: &[u8],
-    region: Region,
-    base_size: usize,
-    chain: &[&str],
-    sources: &[SourceStamp],
-) {
-    let sum = payload_sum(bytes);
-    let mut sources_text = String::new();
-    for source in sources {
-        if !sources_text.is_empty() {
-            sources_text.push('|');
-        }
-        sources_text.push_str(&format!("{} {:#x} {}", source.path.display(), source.size, source.mtime));
-    }
-    append_note(&format!(
-        "{:010x} wrote key {:016x} sum {:016x} len {:#x} region {region:?} base {base_size:#x} chain {} sources {sources_text}\n",
-        hash.0,
-        key,
-        sum,
-        bytes.len(),
-        chain.join(",")
-    ));
-}
-
-fn alert(reason: &str) {
-    skyline::error::show_error(
-        69,
-        "ARCropolis kept a bad cache file.\nClose the game to copy it, or continue.\0",
-        &format!("{reason}\nSee reject.log in the patched cache folder.\0"),
-    );
-}
-
-fn park(path: &Path, reason: &str) {
-    let bad = path.with_extension("bad");
-    let _ = std::fs::remove_file(&bad);
-    let parked = std::fs::rename(path, &bad).is_ok();
-    let line = format!("{reason} parked={parked}");
-    append_note(&format!("{line}\n"));
-    alert(&line);
-}
-
-pub fn note_index(hash: Hash40, index: usize) {
-    let line = format!("{:010x} path-index {index}", hash.0);
-    append_note(&format!("{line}\n"));
-    alert(&line);
+    let _ = writeln!(log, "{reason}");
 }
 
 pub fn probe(hash: Hash40, key: u64) -> Option<PatchedEntry> {
@@ -291,7 +241,7 @@ pub fn probe(hash: Hash40, key: u64) -> Option<PatchedEntry> {
         park(&path, &format!("{:010x} short-header", hash.0));
         return None;
     }
-    let (stored_key, len, _) = decode_header(&header)?;
+    let (stored_key, len, sum) = decode_header(&header)?;
     if stored_key != key {
         return None;
     }
@@ -299,6 +249,25 @@ pub fn probe(hash: Hash40, key: u64) -> Option<PatchedEntry> {
     if size != HEADER_LEN as u64 + len {
         drop(file);
         park(&path, &format!("{:010x} size file {size:#x} header {len:#x}", hash.0));
+        return None;
+    }
+    let actual = match stream_sum(&mut file, len) {
+        Ok(actual) => actual,
+        Err(_) => {
+            drop(file);
+            park(&path, &format!("{:010x} short-payload", hash.0));
+            return None;
+        }
+    };
+    drop(file);
+    if actual != sum {
+        park(
+            &path,
+            &format!(
+                "{:010x} checksum key {key:016x} len {len:#x} stored {sum:016x} actual {actual:016x}",
+                hash.0
+            ),
+        );
         return None;
     }
     Some(PatchedEntry {
@@ -315,7 +284,7 @@ pub fn write(hash: Hash40, key: u64, bytes: &[u8]) -> std::io::Result<PatchedEnt
         let mut file = File::create(&tmp)?;
         file.write_all(&encode_header(key, bytes.len() as u64, payload_sum(bytes)))?;
         file.write_all(bytes)?;
-        file.flush()?;
+        file.sync_all()?;
     }
     let _ = std::fs::remove_file(&path);
     if let Err(e) = std::fs::rename(&tmp, &path) {
@@ -358,76 +327,28 @@ pub fn prune(keep: &HashSet<Hash40>) -> usize {
     removed
 }
 
-fn open_checked(entry: &PatchedEntry) -> Result<(File, u64), ModFsError> {
+fn open_payload(entry: &PatchedEntry) -> Result<File, ModFsError> {
     let mut file = File::open(&entry.path)?;
-    let mut header = [0u8; HEADER_LEN];
-    if file.read_exact(&mut header).is_err() {
-        drop(file);
-        park(&entry.path, &format!("{} short-header", entry.path.display()));
-        return Err(ModFsError::Handler(format!(
-            "patched blob {} has a short header",
-            entry.path.display()
-        )));
-    }
-    let (_, len, sum) = decode_header(&header).ok_or_else(|| {
-        ModFsError::Handler(format!("patched blob {} has a short header", entry.path.display()))
-    })?;
-    if len as usize != entry.len {
-        drop(file);
-        park(
-            &entry.path,
-            &format!("{} length entry {:#x} header {:#x}", entry.path.display(), entry.len, len),
-        );
-        return Err(ModFsError::Handler(format!(
-            "patched blob {} holds {:#x} bytes but its header says {:#x}",
-            entry.path.display(),
-            entry.len,
-            len
-        )));
-    }
-    Ok((file, sum))
-}
-
-fn confirm_sum(entry: &PatchedEntry, bytes: &[u8], sum: u64) -> Result<(), ModFsError> {
-    let actual = payload_sum(bytes);
-    if actual == sum {
-        return Ok(());
-    }
-    let name = entry.path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("?");
-    park(
-        &entry.path,
-        &format!(
-            "{name} checksum key {:016x} len {:#x} stored {:016x} actual {:016x}",
-            entry.key, entry.len, sum, actual
-        ),
-    );
-    Err(ModFsError::Handler(format!(
-        "patched blob {} checksum does not match its header",
-        entry.path.display()
-    )))
+    file.seek(SeekFrom::Start(HEADER_LEN as u64))?;
+    Ok(file)
 }
 
 pub fn read(entry: &PatchedEntry) -> Result<Vec<u8>, ModFsError> {
-    let _serving = enter_serving(entry);
-    let (mut file, sum) = open_checked(entry)?;
+    let mut file = open_payload(entry)?;
     let mut bytes = vec![0u8; entry.len];
     file.read_exact(&mut bytes)?;
-    confirm_sum(entry, &bytes, sum)?;
     Ok(bytes)
 }
 
 pub fn read_into(entry: &PatchedEntry, buffer: &mut [u8]) -> Result<usize, ModFsError> {
-    let _serving = enter_serving(entry);
     if entry.len > buffer.len() {
         return Err(ModFsError::BufferTooSmall {
             needed: entry.len,
             available: buffer.len(),
         });
     }
-    let (mut file, sum) = open_checked(entry)?;
-    let bytes = &mut buffer[..entry.len];
-    file.read_exact(bytes)?;
-    confirm_sum(entry, bytes, sum)?;
+    let mut file = open_payload(entry)?;
+    file.read_exact(&mut buffer[..entry.len])?;
     Ok(entry.len)
 }
 
@@ -571,5 +492,94 @@ mod tests {
             key(Region::UsEnglish, 0x100, &chain, &sample()),
             key(Region::UsEnglish, 0x100, &chain, &doubled)
         );
+    }
+
+    struct CacheDir(PathBuf);
+
+    impl CacheDir {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("arcrop-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(root.clone()));
+            Self(root)
+        }
+    }
+
+    impl Drop for CacheDir {
+        fn drop(&mut self) {
+            DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn corrupted_blob_is_kept_and_rebuilt() {
+        let root = CacheDir::new("corrupt");
+        let hash = Hash40(0x0a11);
+        let payload = b"patched-bytes";
+        let replacement = b"rebuilt-payload";
+        let key = 0x55aa_u64;
+        write(hash, key, payload).unwrap();
+        let path = blob_path(hash);
+        let mut stored = std::fs::read(&path).unwrap();
+        stored[HEADER_LEN] ^= 0xff;
+        std::fs::write(&path, &stored).unwrap();
+
+        assert!(probe(hash, key).is_none());
+        let bad = path.with_extension("bad");
+        assert_eq!(std::fs::read(&bad).unwrap(), stored);
+        assert!(!path.exists());
+        let log = std::fs::read_to_string(root.0.join("reject.log")).unwrap();
+        assert!(log.contains("checksum"), "{}", log);
+
+        let entry = write(hash, key, replacement).unwrap();
+        assert_eq!(entry.len, replacement.len());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), (HEADER_LEN + replacement.len()) as u64);
+        let indexed = probe(hash, key).expect("rebuilt blob");
+        assert_eq!(indexed.len, replacement.len());
+        assert_eq!(read(&indexed).unwrap(), replacement);
+        let mut buffer = [0u8; 32];
+        assert_eq!(read_into(&indexed, &mut buffer).unwrap(), replacement.len());
+        assert_eq!(&buffer[..replacement.len()], replacement);
+        assert!(bad.is_file());
+        let mut keep = HashSet::new();
+        keep.insert(hash);
+        assert_eq!(prune(&keep), 0);
+        assert!(bad.is_file());
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn key_mismatch_is_not_evidence() {
+        let _root = CacheDir::new("miss");
+        let hash = Hash40(0x0b22);
+        let payload = b"still-valid";
+        write(hash, 1, payload).unwrap();
+        let path = blob_path(hash);
+        assert!(probe(hash, 2).is_none());
+        assert!(path.is_file());
+        assert!(!path.with_extension("bad").exists());
+        let entry = probe(hash, 1).unwrap();
+        assert_eq!(entry.len, payload.len());
+        assert_eq!(read(&entry).unwrap(), payload);
+    }
+
+    #[test]
+    fn short_file_is_kept_and_replaced_at_its_new_size() {
+        let _root = CacheDir::new("short");
+        let hash = Hash40(0x0c33);
+        let key = 9_u64;
+        write(hash, key, b"0123456789abcdef").unwrap();
+        let path = blob_path(hash);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &original[..HEADER_LEN + 4]).unwrap();
+        assert!(probe(hash, key).is_none());
+        assert_eq!(std::fs::read(path.with_extension("bad")).unwrap().len(), HEADER_LEN + 4);
+        let entry = write(hash, key, b"ok").unwrap();
+        let indexed = probe(hash, key).unwrap();
+        assert_eq!(indexed.len, entry.len);
+        assert_eq!(indexed.len, 2);
+        assert_eq!(read(&indexed).unwrap(), b"ok");
     }
 }

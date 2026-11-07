@@ -1,0 +1,8 @@
+[package]
+name = "arcropolis-cache-check"
+version = "0.0.0"
+edition = "2018"
+publish = false
+
+[dependencies]
+smash-arc = { version = "0.6.0", default-features = false, features = ["dir-listing", "smash-runtime", "rust-zstd", "serialize"] }
