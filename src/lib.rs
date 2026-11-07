@@ -492,7 +492,6 @@ unsafe fn title_scene_show_how_to_play_fake_state_index(ctx: &mut InlineCtx) {
     ctx.registers[8].set_x(5);
 }
 
-#[cfg(not(test))]
 #[skyline::main(name = "arcropolis")]
 pub fn main() {
     std::panic::set_hook(Box::new(|info| {

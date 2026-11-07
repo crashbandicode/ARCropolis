@@ -19,6 +19,12 @@ use crate::{
 };
 
 pub const NO_CHILD: u32 = 0xFF_FFFF;
+
+/// The no-child marker is 24 bits. `0x40FFFFFF` is that marker with bit 30 set, and a raw compare lets it through.
+pub fn child_index(index: u32) -> Option<usize> {
+    let index = (index & NO_CHILD) as usize;
+    if index == NO_CHILD as usize { None } else { Some(index) }
+}
 pub const INVALID_INDEX: u32 = 0xFFFF_FFFF;
 
 /// Used to keep track of added DirInfo children.
@@ -138,15 +144,13 @@ impl AdditionContext {
     pub fn get_directory_dependency_ctx(&self, dir_info: &DirInfo) -> Option<RedirectionType> {
         if dir_info.flags.redirected() {
             let directory_index = self.folder_offsets_vec[dir_info.path.index() as usize].directory_index;
-
-            if directory_index != NO_CHILD {
-                if dir_info.flags.is_symlink() {
-                    Some(RedirectionType::Symlink(self.dir_infos_vec[directory_index as usize]))
-                } else {
-                    Some(RedirectionType::Shared(self.folder_offsets_vec[directory_index as usize]))
-                }
+            let Some(index) = child_index(directory_index) else {
+                return None;
+            };
+            if dir_info.flags.is_symlink() {
+                (index < self.dir_infos_vec.len()).then(|| RedirectionType::Symlink(self.dir_infos_vec[index]))
             } else {
-                None
+                (index < self.folder_offsets_vec.len()).then(|| RedirectionType::Shared(self.folder_offsets_vec[index]))
             }
         } else {
             None
@@ -984,5 +988,18 @@ impl FromPathExt for PathListEntry {
         result.parent.set_length(parent_hash.len());
 
         Some(result)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{child_index, NO_CHILD};
+
+    #[test]
+    fn flagged_no_child_is_empty() {
+        assert_eq!(child_index(0x40FF_FFFF), None);
+        assert_eq!(child_index(NO_CHILD), None);
+        assert_eq!(child_index(0x4000_002A), Some(0x2A));
     }
 }

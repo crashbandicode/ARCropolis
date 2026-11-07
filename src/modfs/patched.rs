@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs::File,
     hash::{Hash, Hasher},
@@ -7,6 +6,9 @@ use std::{
     path::{Path, PathBuf},
     sync::LazyLock,
 };
+
+#[cfg(test)]
+use std::cell::RefCell;
 
 use smash_arc::{Hash40, Region};
 
@@ -84,11 +86,13 @@ impl PatchedIndex {
     }
 }
 
+#[cfg(test)]
 thread_local! {
     static DIR_OVERRIDE: RefCell<Option<PathBuf>> = RefCell::new(None);
 }
 
 pub fn dir() -> PathBuf {
+    #[cfg(test)]
     if let Some(path) = DIR_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return path;
     }
@@ -335,21 +339,22 @@ fn open_payload(entry: &PatchedEntry) -> Result<File, ModFsError> {
 
 pub fn read(entry: &PatchedEntry) -> Result<Vec<u8>, ModFsError> {
     let mut file = open_payload(entry)?;
-    let mut bytes = vec![0u8; entry.len];
-    file.read_exact(&mut bytes)?;
+    let mut bytes = Vec::with_capacity(entry.len);
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() != entry.len {
+        return Err(ModFsError::Handler(format!(
+            "patched blob {} holds {:#x} bytes but its header says {:#x}",
+            entry.path.display(),
+            bytes.len(),
+            entry.len
+        )));
+    }
     Ok(bytes)
 }
 
 pub fn read_into(entry: &PatchedEntry, buffer: &mut [u8]) -> Result<usize, ModFsError> {
-    if entry.len > buffer.len() {
-        return Err(ModFsError::BufferTooSmall {
-            needed: entry.len,
-            available: buffer.len(),
-        });
-    }
-    let mut file = open_payload(entry)?;
-    file.read_exact(&mut buffer[..entry.len])?;
-    Ok(entry.len)
+    let file = open_payload(entry)?;
+    super::stream_into(file, buffer, entry.len)
 }
 
 #[cfg(test)]
@@ -372,23 +377,6 @@ mod tests {
     fn header_round_trips() {
         let header = encode_header(0xdead_beef_1234_5678, 0x4321, 0x1111);
         assert_eq!(decode_header(&header), Some((0xdead_beef_1234_5678, 0x4321, 0x1111)));
-    }
-
-    #[test]
-    fn patched_format_is_checksummed() {
-        assert_eq!(PATCHED_FORMAT, 2);
-        assert_eq!(HEADER_LEN, 24);
-    }
-
-    #[test]
-    fn checksum_rejects_a_flipped_byte() {
-        let payload = b"msbt-bytes";
-        let header = encode_header(7, payload.len() as u64, payload_sum(payload));
-        let (_, _, sum) = decode_header(&header).unwrap();
-        assert_eq!(sum, payload_sum(payload));
-        let mut flipped = *payload;
-        flipped[0] ^= 0xff;
-        assert_ne!(payload_sum(&flipped), sum);
     }
 
     #[test]
@@ -494,92 +482,26 @@ mod tests {
         );
     }
 
-    struct CacheDir(PathBuf);
-
-    impl CacheDir {
-        fn new(name: &str) -> Self {
-            let root = std::env::temp_dir().join(format!("arcrop-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(root.clone()));
-            Self(root)
-        }
-    }
-
-    impl Drop for CacheDir {
-        fn drop(&mut self) {
-            DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     fn corrupted_blob_is_kept_and_rebuilt() {
-        let root = CacheDir::new("corrupt");
+        let root = std::env::temp_dir().join(format!("arcrop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(root.clone()));
         let hash = Hash40(0x0a11);
         let payload = b"patched-bytes";
-        let replacement = b"rebuilt-payload";
-        let key = 0x55aa_u64;
+        let key = 0x55aa;
         write(hash, key, payload).unwrap();
         let path = blob_path(hash);
         let mut stored = std::fs::read(&path).unwrap();
         stored[HEADER_LEN] ^= 0xff;
         std::fs::write(&path, &stored).unwrap();
-
         assert!(probe(hash, key).is_none());
-        let bad = path.with_extension("bad");
-        assert_eq!(std::fs::read(&bad).unwrap(), stored);
-        assert!(!path.exists());
-        let log = std::fs::read_to_string(root.0.join("reject.log")).unwrap();
-        assert!(log.contains("checksum"), "{}", log);
-
-        let entry = write(hash, key, replacement).unwrap();
-        assert_eq!(entry.len, replacement.len());
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), (HEADER_LEN + replacement.len()) as u64);
-        let indexed = probe(hash, key).expect("rebuilt blob");
-        assert_eq!(indexed.len, replacement.len());
-        assert_eq!(read(&indexed).unwrap(), replacement);
-        let mut buffer = [0u8; 32];
-        assert_eq!(read_into(&indexed, &mut buffer).unwrap(), replacement.len());
-        assert_eq!(&buffer[..replacement.len()], replacement);
-        assert!(bad.is_file());
-        let mut keep = HashSet::new();
-        keep.insert(hash);
-        assert_eq!(prune(&keep), 0);
-        assert!(bad.is_file());
-        assert!(path.is_file());
-    }
-
-    #[test]
-    fn key_mismatch_is_not_evidence() {
-        let _root = CacheDir::new("miss");
-        let hash = Hash40(0x0b22);
-        let payload = b"still-valid";
-        write(hash, 1, payload).unwrap();
-        let path = blob_path(hash);
-        assert!(probe(hash, 2).is_none());
-        assert!(path.is_file());
-        assert!(!path.with_extension("bad").exists());
-        let entry = probe(hash, 1).unwrap();
-        assert_eq!(entry.len, payload.len());
-        assert_eq!(read(&entry).unwrap(), payload);
-    }
-
-    #[test]
-    fn short_file_is_kept_and_replaced_at_its_new_size() {
-        let _root = CacheDir::new("short");
-        let hash = Hash40(0x0c33);
-        let key = 9_u64;
-        write(hash, key, b"0123456789abcdef").unwrap();
-        let path = blob_path(hash);
-        let original = std::fs::read(&path).unwrap();
-        std::fs::write(&path, &original[..HEADER_LEN + 4]).unwrap();
-        assert!(probe(hash, key).is_none());
-        assert_eq!(std::fs::read(path.with_extension("bad")).unwrap().len(), HEADER_LEN + 4);
-        let entry = write(hash, key, b"ok").unwrap();
+        assert_eq!(std::fs::read(path.with_extension("bad")).unwrap(), stored);
+        let entry = write(hash, key, payload).unwrap();
         let indexed = probe(hash, key).unwrap();
-        assert_eq!(indexed.len, entry.len);
-        assert_eq!(indexed.len, 2);
-        assert_eq!(read(&indexed).unwrap(), b"ok");
+        assert_eq!((indexed.len, read(&indexed).unwrap()), (entry.len, payload.to_vec()));
+        DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

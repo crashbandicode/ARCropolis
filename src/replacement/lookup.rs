@@ -43,16 +43,15 @@ enum ShareLookupState {
     Generated(ShareLookup),
 }
 
+const LUT_VERSION: u32 = 1;
+
 static UNSHARE_LOOKUP: LazyLock<RwLock<UnshareLookupState>> = LazyLock::new(|| {
     let path = crate::utils::paths::cache().join("unshare.lut");
     let lut = match std::fs::read(&path) {
-        Ok(data) => match bincode::deserialize(&data) {
-            Ok(lut) => UnshareLookupState::Generated(lut),
-            Err(e) => {
-                error!(
-                    "Unable to parse '{}' for unsharing. Reason: {:?}. Boot time might be a bit slow.",
-                    path, *e
-                );
+        Ok(data) => match bincode::deserialize::<(u32, UnshareLookup)>(&data) {
+            Ok((LUT_VERSION, lut)) => UnshareLookupState::Generated(lut),
+            _ => {
+                error!("Unable to parse '{}' for unsharing. Boot time might be a bit slow.", path);
                 UnshareLookupState::Missing
             },
         },
@@ -68,13 +67,10 @@ static UNSHARE_LOOKUP: LazyLock<RwLock<UnshareLookupState>> = LazyLock::new(|| {
 static SHARE_LOOKUP: LazyLock<RwLock<ShareLookupState>> = LazyLock::new(|| {
     let path = crate::utils::paths::cache().join("share.lut");
     let lut = match std::fs::read(&path) {
-        Ok(data) => match bincode::deserialize(&data) {
-            Ok(lut) => ShareLookupState::Generated(lut),
-            Err(e) => {
-                error!(
-                    "Unable to parse '{}' for share lookup. Reason: {:?}. Boot time might be a bit slow.",
-                    path, *e
-                );
+        Ok(data) => match bincode::deserialize::<(u32, ShareLookup)>(&data) {
+            Ok((LUT_VERSION, lut)) => ShareLookupState::Generated(lut),
+            _ => {
+                error!("Unable to parse '{}' for share lookup. Boot time might be a bit slow.", path);
                 ShareLookupState::Missing
             },
         },
@@ -106,7 +102,7 @@ pub fn initialize_unshare(arc: Option<&LoadedArc>) {
                 }
             }
 
-            match bincode::serialize(&lookup) {
+            match bincode::serialize(&(LUT_VERSION, &lookup)) {
                 Ok(data) => {
                     let path = crate::utils::paths::cache().join("unshare.lut");
                     if let Err(e) = std::fs::write(&path, data) {
@@ -182,7 +178,7 @@ pub fn initialize_share(arc: Option<&LoadedArc>) {
                 shared_file_lookup: path_shared,
             };
 
-            match bincode::serialize(&lookup) {
+            match bincode::serialize(&(LUT_VERSION, &lookup)) {
                 Ok(data) => {
                     let path = crate::utils::paths::cache().join("share.lut");
                     if let Err(e) = std::fs::write(&path, data) {

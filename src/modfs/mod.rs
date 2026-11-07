@@ -406,6 +406,7 @@ impl ModFs {
             let key = patched::key(region, base_size, &chain, &sources);
             let estimate = self.handlers.patched_size_for_hash(hash, base_size).unwrap_or(base_size);
             let source_count = sources.len();
+            drop(sources);
 
             if let Some(entry) = patched::probe(hash, key) {
                 debug!(

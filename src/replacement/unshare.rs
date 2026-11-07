@@ -434,7 +434,7 @@ pub fn reshare_file_groups(ctx: &mut AdditionContext) {
         .iter()
         .filter_map(|dir_info| {
             if let Some(RedirectionType::Shared(file_group)) = ctx.get_directory_dependency_ctx(dir_info) {
-                if file_group.directory_index != 0xFF_FFFF {
+                if child_index(file_group.directory_index).is_some() {
                     Some((dir_info.file_info_range(), file_group.range(), dir_info.path.index() as usize))
                 } else {
                     None
