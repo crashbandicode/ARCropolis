@@ -2,7 +2,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs::File,
     hash::{Hash, Hasher},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -11,9 +11,9 @@ use smash_arc::{Hash40, Region};
 
 use super::ModFsError;
 
-const PATCHED_FORMAT: u32 = 1;
+const PATCHED_FORMAT: u32 = 2;
 
-const HEADER_LEN: usize = 16;
+const HEADER_LEN: usize = 24;
 
 const BLOB_SUFFIX: &str = ".bin";
 const TMP_SUFFIX: &str = ".tmp";
@@ -155,22 +155,34 @@ pub fn key(region: Region, base_size: usize, chain: &[&str], sources: &[SourceSt
     hasher.finish()
 }
 
-pub fn encode_header(key: u64, len: u64) -> [u8; HEADER_LEN] {
+fn payload_sum(bytes: &[u8]) -> u64 {
+    let mut sum = 0xcbf29ce484222325u64;
+    for &byte in bytes {
+        sum ^= byte as u64;
+        sum = sum.wrapping_mul(0x100000001b3);
+    }
+    sum
+}
+
+pub fn encode_header(key: u64, len: u64, sum: u64) -> [u8; HEADER_LEN] {
     let mut header = [0u8; HEADER_LEN];
     header[..8].copy_from_slice(&key.to_le_bytes());
-    header[8..].copy_from_slice(&len.to_le_bytes());
+    header[8..16].copy_from_slice(&len.to_le_bytes());
+    header[16..].copy_from_slice(&sum.to_le_bytes());
     header
 }
 
-pub fn decode_header(bytes: &[u8]) -> Option<(u64, u64)> {
+pub fn decode_header(bytes: &[u8]) -> Option<(u64, u64, u64)> {
     if bytes.len() < HEADER_LEN {
         return None;
     }
     let mut key = [0u8; 8];
     let mut len = [0u8; 8];
+    let mut sum = [0u8; 8];
     key.copy_from_slice(&bytes[..8]);
-    len.copy_from_slice(&bytes[8..HEADER_LEN]);
-    Some((u64::from_le_bytes(key), u64::from_le_bytes(len)))
+    len.copy_from_slice(&bytes[8..16]);
+    sum.copy_from_slice(&bytes[16..HEADER_LEN]);
+    Some((u64::from_le_bytes(key), u64::from_le_bytes(len), u64::from_le_bytes(sum)))
 }
 
 pub fn probe(hash: Hash40, key: u64) -> Option<PatchedEntry> {
@@ -178,18 +190,20 @@ pub fn probe(hash: Hash40, key: u64) -> Option<PatchedEntry> {
     let mut file = File::open(&path).ok()?;
     let mut header = [0u8; HEADER_LEN];
     file.read_exact(&mut header).ok()?;
-    let (stored_key, len) = decode_header(&header)?;
+    let (stored_key, len, _) = decode_header(&header)?;
     if stored_key != key {
         return None;
     }
     if file.metadata().ok()?.len() != HEADER_LEN as u64 + len {
         return None;
     }
-    Some(PatchedEntry {
+    let entry = PatchedEntry {
         path,
         len: len as usize,
         key,
-    })
+    };
+    read(&entry).ok()?;
+    Some(entry)
 }
 
 pub fn write(hash: Hash40, key: u64, bytes: &[u8]) -> std::io::Result<PatchedEntry> {
@@ -197,7 +211,7 @@ pub fn write(hash: Hash40, key: u64, bytes: &[u8]) -> std::io::Result<PatchedEnt
     let tmp = dir().join(format!("{:010x}{}", hash.0, TMP_SUFFIX));
     {
         let mut file = File::create(&tmp)?;
-        file.write_all(&encode_header(key, bytes.len() as u64))?;
+        file.write_all(&encode_header(key, bytes.len() as u64, payload_sum(bytes)))?;
         file.write_all(bytes)?;
         file.flush()?;
     }
@@ -242,30 +256,34 @@ pub fn prune(keep: &HashSet<Hash40>) -> usize {
     removed
 }
 
-fn open_payload(entry: &PatchedEntry) -> Result<File, ModFsError> {
-    let mut file = File::open(&entry.path)?;
-    file.seek(SeekFrom::Start(HEADER_LEN as u64))?;
-    Ok(file)
-}
-
 pub fn read(entry: &PatchedEntry) -> Result<Vec<u8>, ModFsError> {
-    let mut file = open_payload(entry)?;
-    let mut bytes = Vec::with_capacity(entry.len);
-    file.read_to_end(&mut bytes)?;
-    if bytes.len() != entry.len {
+    let mut file = File::open(&entry.path)?;
+    let mut header = [0u8; HEADER_LEN];
+    file.read_exact(&mut header)?;
+    let (_, len, sum) = decode_header(&header).ok_or_else(|| {
+        ModFsError::Handler(format!("patched blob {} has a short header", entry.path.display()))
+    })?;
+    if len as usize != entry.len {
         return Err(ModFsError::Handler(format!(
             "patched blob {} holds {:#x} bytes but its header says {:#x}",
             entry.path.display(),
-            bytes.len(),
-            entry.len
+            entry.len,
+            len
+        )));
+    }
+    let mut bytes = vec![0u8; entry.len];
+    file.read_exact(&mut bytes)?;
+    if payload_sum(&bytes) != sum {
+        return Err(ModFsError::Handler(format!(
+            "patched blob {} checksum does not match its header",
+            entry.path.display()
         )));
     }
     Ok(bytes)
 }
 
 pub fn read_into(entry: &PatchedEntry, buffer: &mut [u8]) -> Result<usize, ModFsError> {
-    let file = open_payload(entry)?;
-    super::stream_into(file, buffer, entry.len)
+    super::copy_into(&read(entry)?, buffer)
 }
 
 #[cfg(test)]
@@ -286,13 +304,30 @@ mod tests {
 
     #[test]
     fn header_round_trips() {
-        let header = encode_header(0xdead_beef_1234_5678, 0x4321);
-        assert_eq!(decode_header(&header), Some((0xdead_beef_1234_5678, 0x4321)));
+        let header = encode_header(0xdead_beef_1234_5678, 0x4321, 0x1111);
+        assert_eq!(decode_header(&header), Some((0xdead_beef_1234_5678, 0x4321, 0x1111)));
+    }
+
+    #[test]
+    fn patched_format_is_checksummed() {
+        assert_eq!(PATCHED_FORMAT, 2);
+        assert_eq!(HEADER_LEN, 24);
+    }
+
+    #[test]
+    fn checksum_rejects_a_flipped_byte() {
+        let payload = b"msbt-bytes";
+        let header = encode_header(7, payload.len() as u64, payload_sum(payload));
+        let (_, _, sum) = decode_header(&header).unwrap();
+        assert_eq!(sum, payload_sum(payload));
+        let mut flipped = *payload;
+        flipped[0] ^= 0xff;
+        assert_ne!(payload_sum(&flipped), sum);
     }
 
     #[test]
     fn header_rejects_truncation() {
-        let header = encode_header(1, 2);
+        let header = encode_header(1, 2, 3);
         for len in 0..HEADER_LEN {
             assert_eq!(decode_header(&header[..len]), None, "{} bytes should not decode", len);
         }
