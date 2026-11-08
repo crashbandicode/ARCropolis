@@ -219,6 +219,8 @@ pub fn decode_header(bytes: &[u8]) -> Option<(u64, u64, u64)> {
     Some((u64::from_le_bytes(key), u64::from_le_bytes(len), u64::from_le_bytes(sum)))
 }
 
+const REJECT_LOG_CAP: u64 = 64 * 1024;
+
 fn park(path: &Path, reason: &str) {
     let bad = path.with_extension("bad");
     let _ = std::fs::remove_file(&bad);
@@ -226,14 +228,15 @@ fn park(path: &Path, reason: &str) {
         return;
     }
     let _ = std::fs::create_dir_all(dir());
-    let Ok(mut log) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir().join("reject.log"))
-    else {
+    let log_path = dir().join("reject.log");
+    if std::fs::metadata(&log_path).map(|meta| meta.len()).unwrap_or(0) >= REJECT_LOG_CAP {
+        return;
+    }
+    let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) else {
         return;
     };
-    let _ = writeln!(log, "{reason}");
+    let line: String = reason.chars().take(180).collect();
+    let _ = writeln!(log, "{line}");
 }
 
 pub fn probe(hash: Hash40, key: u64) -> Option<PatchedEntry> {
@@ -516,6 +519,24 @@ mod tests {
         short.truncate(HEADER_LEN + 1);
         std::fs::write(blob_path(hash), short).unwrap();
         assert!(read_into(&indexed, &mut buffer).is_err());
+        DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reject_log_stops_growing() {
+        let root = std::env::temp_dir().join(format!("arcrop-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(root.clone()));
+        let log_path = root.join("reject.log");
+        std::fs::write(&log_path, vec![b'x'; REJECT_LOG_CAP as usize]).unwrap();
+        let blob = root.join("aabbccddee.bin");
+        std::fs::write(&blob, b"gone").unwrap();
+        park(&blob, "should-not-append");
+        assert_eq!(std::fs::metadata(&log_path).unwrap().len(), REJECT_LOG_CAP);
+        assert!(blob.with_extension("bad").is_file());
+        assert!(!std::fs::read_to_string(&log_path).unwrap().contains("should-not-append"));
         DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(root);
     }
